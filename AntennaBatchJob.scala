@@ -4,12 +4,12 @@ import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 
 import java.time.OffsetDateTime
 
-object AntennaBatchJob extends BatchJob {
+object PracticaBatchJob extends BatchJob {
 
   override val spark: SparkSession = SparkSession
     .builder()
     .master(master = "local[20]")
-    .appName(name = "Final Exercise SQL Streaming")
+    .appName(name = "Final Practice SQL Streaming")
     .getOrCreate()
 
   import spark.implicits._
@@ -20,12 +20,13 @@ object AntennaBatchJob extends BatchJob {
       .format("parquet")
       .load(s"$storagePath/data")
       .filter(
-        $"year" === filterDate.getYear &&
-        $"month" === filterDate.getMonthValue &&
-        $"day" === filterDate.getDayOfMonth &&
-        $"hour" === filterDate.getHour
+          year($"timestamp").as("year") === filterDate.getYear &&
+          month($"timestamp").as("month") === filterDate.getMonthValue &&
+          dayofmonth($"timestamp").as("day") === filterDate.getDayOfMonth &&
+          hour($"timestamp").as("hour") === filterDate.getHour
       )
   }
+
 
   override def readAntennaMetadata(jdbcURI: String, jdbcTable: String, user: String, password: String): DataFrame = {
     spark
@@ -48,22 +49,55 @@ object AntennaBatchJob extends BatchJob {
       .drop($"b.id")
   }
 
-  override def computeDevicesCountByCoordinates(dataFrame: DataFrame): DataFrame = {
+  override def computeBytesSUMbyAntenna(dataFrame: DataFrame): DataFrame = {
     dataFrame
-      .filter($"metric" === "devices_count")
-      .select($"timestamp", $"location", $"value")
-      .groupBy($"location", window($"timestamp", "1 hour").as("window"))
+      .select($"antenna_id", $"timestamp", $"bytes")
+      .groupBy($"antenna_id", window($"timestamp", "1 hour")) //1 hour
       .agg(
-        avg($"value").as("avg_devices_count"),
-        max($"value").as("max_devices_count"),
-        min($"value").as("min_devices_count")
+        sum($"bytes").as("value"),
       )
-      .select($"location", $"window.start".as("date"), $"avg_devices_count", $"max_devices_count", $"min_devices_count")
+      .withColumn("type", lit("antenna_bytes_total"))
+      .select($"window.start".as("timestamp"), $"antenna_id".as("id"), $"value", $"type")
+
   }
 
-  override def computeErrorAntennaByModelAndVersion(dataFrame: DataFrame): DataFrame = ???
+  override def computeBytesSUMbyApp(dataFrame: DataFrame): DataFrame = {
+    dataFrame
+      .select($"app", $"timestamp", $"bytes")
+      .groupBy($"app", window($"timestamp", "1 hour")) //1 hour
+      .agg(
+        sum($"bytes").as("value"),
+      )
+      .withColumn("type", lit("app_bytes_total"))
+      .select($"window.start".as("timestamp"), $"app".as("id"), $"value", $"type")
 
-  override def computePercentStatusByID(dataFrame: DataFrame): DataFrame = ???
+  }
+
+  override def computeBytesSUMbyUser(dataFrame: DataFrame): DataFrame = {
+    dataFrame
+      .select($"email", $"bytes", $"quota", $"timestamp")
+      .groupBy($"email", window($"timestamp", "1 hour"), $"quota") //1 hour
+      .agg(
+        sum($"bytes").as("usage"),
+      )
+      .select($"email", $"usage", $"quota", $"window.start".as("timestamp"))
+
+  }
+
+  override def computeBytesExceedQuota(dataFrame: DataFrame): DataFrame = {
+    dataFrame
+      .select($"email", $"bytes", $"quota", $"timestamp")
+      .groupBy($"email", window($"timestamp", "1 hour"), $"quota") //1 hour
+      .agg(
+        sum($"bytes").as("usage"),
+      )
+      .filter(
+        $"quota" < $"usage"
+      )
+      .withColumn("Exceeded", lit("has_exceeded"))
+      .select($"email", $"usage", $"quota", $"window.start".as("timestamp"), $"Exceeded")
+
+  }
 
   override def writeToJdbc(dataFrame: DataFrame, jdbcURI: String, jdbcTable: String, user: String, password: String): Unit = {
     dataFrame
@@ -84,31 +118,46 @@ object AntennaBatchJob extends BatchJob {
       .format("parquet")
       .partitionBy("year", "month", "day", "hour")
       .mode(SaveMode.Overwrite)
-      .save(s"$storageRootPath/historical")
+      .save(s"$storageRootPath/historical_practica")
   }
 
   def main(args: Array[String]): Unit = {
-    val offsetDateTime = OffsetDateTime.parse("2022-12-08T11:00:00Z")
-    val parquetDF = readFromStorage("/tmp/antenna_parquet/", offsetDateTime)
-
+    val offsetDateTime = OffsetDateTime.parse("2022-12-08T14:25Z")
+    val parquetDF = readFromStorage("/tmp/parsedDF_parquet/", offsetDateTime)
 
     val metadataDF = readAntennaMetadata("jdbc:postgresql://34.175.25.228:5432/postgres",
-      "metadata",
-      "postgres",
-      "postgres")
+    "user_metadata",
+    "postgres",
+    "postgres")
+
     val antennaMetadataDF = enrichAntennaWithMetadata(parquetDF, metadataDF).cache()
-    val aggByCoordinatesDF = computeDevicesCountByCoordinates(antennaMetadataDF)
-
-    writeToJdbc(aggByCoordinatesDF, "jdbc:postgresql://34.175.25.228:5432/postgres",
-      "antenna_1h_agg",
+    val aggByAntenna = computeBytesSUMbyAntenna(antennaMetadataDF)
+    writeToJdbc(aggByAntenna, "jdbc:postgresql://34.175.25.228:5432/postgres",
+      "bytes_hourly",
       "postgres",
       "postgres")
 
-    writeToStorage(parquetDF, "/tmp/antenna_parquet/")
+    val aggByApp = computeBytesSUMbyApp(antennaMetadataDF)
+    writeToJdbc(aggByApp, "jdbc:postgresql://34.175.25.228:5432/postgres",
+      "bytes_hourly",
+      "postgres",
+      "postgres")
 
-    spark.close()
+    val aggByUser = computeBytesSUMbyUser(antennaMetadataDF)
+    writeToJdbc(aggByUser, "jdbc:postgresql://34.175.25.228:5432/postgres",
+      "user_quota_limit",
+      "postgres",
+      "postgres")
+
+    val exceedquota = computeBytesExceedQuota(antennaMetadataDF)
+    writeToJdbc(exceedquota, "jdbc:postgresql://34.175.25.228:5432/postgres",
+      "exceeded",
+      "postgres",
+      "postgres")
+
 
 
   }
 
 }
+
